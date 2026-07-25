@@ -1,0 +1,15 @@
+interface:
+  display_name: "文献调研"
+  short_description: "跨学术数据库完成检索、核验、去重、证据分级与综述输出"
+  default_prompt: "Use $literature-research to search, verify, deduplicate, and synthesize the literature on this topic with traceable citations."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "semantic-scholar"
+      description: "Semantic Scholar discovery, authors, citations, and references"
+    - type: "mcp"
+      value: "arxiv"
+      description: "arXiv preprint search and full-text retrieval"
+policy:
+  allow_implicit_invocation: true
+

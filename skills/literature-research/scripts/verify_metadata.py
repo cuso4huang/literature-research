@@ -6,17 +6,31 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import sys
+import time
 import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Any
 
 
 USER_AGENT = "CodexLiteratureResearch/1.0 (metadata verification)"
+
+
+def user_setting(name: str) -> str:
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    path = config_home / "literature-research" / "settings.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return ""
+    value = data.get(name) if isinstance(data, dict) else None
+    return value.strip() if isinstance(value, str) else ""
 
 
 def normalize_doi(value: str | None) -> str | None:
@@ -35,39 +49,60 @@ def normalize_title(value: str | None) -> str:
 
 def get_json(url: str) -> dict[str, Any]:
     headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
-    request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(request, timeout=25) as response:
-        return json.load(response)
+    if "semanticscholar.org" in url and os.environ.get("SEMANTIC_SCHOLAR_API_KEY"):
+        headers["x-api-key"] = os.environ["SEMANTIC_SCHOLAR_API_KEY"]
+    for attempt in range(5):
+        try:
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if attempt == 4 or (exc.code != 429 and not 500 <= exc.code < 600):
+                raise
+            retry_after = exc.headers.get("Retry-After")
+            delay = float(retry_after) if retry_after and retry_after.isdigit() else min(16, 2**attempt) + random.random()
+            time.sleep(delay)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if attempt == 4:
+                raise
+            time.sleep(min(16, 2**attempt) + random.random())
+    raise RuntimeError("unreachable")
 
 
 def crossref(doi: str | None, title: str | None, rows: int) -> list[dict[str, Any]]:
+    mailto = os.environ.get("SCHOLAR_CONTACT_EMAIL") or user_setting("scholar_contact_email")
     if doi:
         url = "https://api.crossref.org/works/" + urllib.parse.quote(doi, safe="")
+        if mailto:
+            url += "?" + urllib.parse.urlencode({"mailto": mailto})
         return [get_json(url)["message"]]
-    params = urllib.parse.urlencode(
-        {
-            "query.title": title,
-            "rows": rows,
-            "select": "DOI,title,author,published,issued,container-title,type,publisher,URL,score",
-        }
-    )
+    values = {"query.title": title, "rows": rows, "select": "DOI,title,author,published,issued,container-title,type,publisher,URL,score"}
+    if mailto:
+        values["mailto"] = mailto
+    params = urllib.parse.urlencode(values)
     return get_json("https://api.crossref.org/works?" + params)["message"]["items"]
 
 
 def openalex(doi: str | None, title: str | None, rows: int) -> list[dict[str, Any]]:
     mailto = os.environ.get("OPENALEX_MAILTO")
+    api_key = os.environ.get("OPENALEX_API_KEY") or user_setting("openalex_api_key")
     if doi:
         identifier = "https://doi.org/" + doi
-        url = "https://api.openalex.org/works/" + urllib.parse.quote(identifier, safe="")
+        url = "https://api.openalex.org/works/" + urllib.parse.quote(identifier, safe="/:")
+        options = {}
         if mailto:
-            url += "?" + urllib.parse.urlencode({"mailto": mailto})
+            options["mailto"] = mailto
+        if api_key:
+            options["api_key"] = api_key
+        if options:
+            url += "?" + urllib.parse.urlencode(options)
         return [get_json(url)]
     params: dict[str, Any] = {"search": title, "per-page": rows}
     if mailto:
         params["mailto"] = mailto
-    return get_json(
-        "https://api.openalex.org/works?" + urllib.parse.urlencode(params)
-    )["results"]
+    if api_key:
+        params["api_key"] = api_key
+    return get_json("https://api.openalex.org/works?" + urllib.parse.urlencode(params))["results"]
 
 
 def first(value: Any) -> Any:
@@ -75,18 +110,14 @@ def first(value: Any) -> Any:
 
 
 def year_from_crossref(record: dict[str, Any]) -> int | None:
-    parts = (record.get("published") or record.get("issued") or {}).get(
-        "date-parts", []
-    )
+    parts = (record.get("published") or record.get("issued") or {}).get("date-parts", [])
     return parts[0][0] if parts and parts[0] else None
 
 
 def compact_crossref(record: dict[str, Any]) -> dict[str, Any]:
     authors = []
     for author in record.get("author", []):
-        authors.append(
-            " ".join(filter(None, [author.get("given"), author.get("family")]))
-        )
+        authors.append(" ".join(filter(None, [author.get("given"), author.get("family")])))
     return {
         "source": "crossref",
         "id": record.get("DOI"),
@@ -125,54 +156,30 @@ def compact_openalex(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def best(
-    records: list[dict[str, Any]], title: str | None, year: int | None
-) -> dict[str, Any] | None:
+def best(records: list[dict[str, Any]], title: str | None, year: int | None) -> dict[str, Any] | None:
     if not records:
         return None
     if not title:
         return records[0]
     target = normalize_title(title)
-
     def score(record: dict[str, Any]) -> float:
-        similarity = SequenceMatcher(
-            None, target, normalize_title(record.get("title"))
-        ).ratio()
+        similarity = SequenceMatcher(None, target, normalize_title(record.get("title"))).ratio()
         if year and record.get("year") and abs(year - record["year"]) > 1:
             similarity -= 0.15
         return similarity
-
     return max(records, key=score)
 
 
-def compare(
-    cr: dict[str, Any] | None, oa: dict[str, Any] | None
-) -> dict[str, Any]:
+def compare(cr: dict[str, Any] | None, oa: dict[str, Any] | None) -> dict[str, Any]:
     if not cr and not oa:
-        return {
-            "status": "unverified",
-            "reason": "No source returned a matching record.",
-        }
+        return {"status": "unverified", "reason": "No source returned a matching record."}
     if not cr or not oa:
         source = (cr or oa or {}).get("source")
-        return {
-            "status": "partially_verified",
-            "reason": f"Only {source} returned a record.",
-        }
+        return {"status": "partially_verified", "reason": f"Only {source} returned a record."}
     doi_agreement = bool(cr.get("doi") and cr.get("doi") == oa.get("doi"))
-    title_similarity = SequenceMatcher(
-        None, normalize_title(cr.get("title")), normalize_title(oa.get("title"))
-    ).ratio()
-    year_agreement = (
-        not cr.get("year")
-        or not oa.get("year")
-        or abs(cr["year"] - oa["year"]) <= 1
-    )
-    status = (
-        "verified"
-        if (doi_agreement or title_similarity >= 0.96) and year_agreement
-        else "conflict"
-    )
+    title_similarity = SequenceMatcher(None, normalize_title(cr.get("title")), normalize_title(oa.get("title"))).ratio()
+    year_agreement = not cr.get("year") or not oa.get("year") or abs(cr["year"] - oa["year"]) <= 1
+    status = "verified" if (doi_agreement or title_similarity >= 0.96) and year_agreement else "conflict"
     return {
         "status": status,
         "doi_agreement": doi_agreement,
@@ -191,37 +198,16 @@ def main() -> int:
     parser.add_argument("--pretty", action="store_true")
     args = parser.parse_args()
     doi = normalize_doi(args.doi)
-    output: dict[str, Any] = {
-        "query": {"doi": doi, "title": args.title, "year": args.year},
-        "errors": {},
-    }
+    output: dict[str, Any] = {"query": {"doi": doi, "title": args.title, "year": args.year}, "errors": {}}
 
     try:
-        cr_records = [
-            compact_crossref(item)
-            for item in crossref(doi, args.title, args.rows)
-        ]
-    except (
-        urllib.error.URLError,
-        urllib.error.HTTPError,
-        TimeoutError,
-        KeyError,
-        ValueError,
-    ) as exc:
+        cr_records = [compact_crossref(item) for item in crossref(doi, args.title, args.rows)]
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, KeyError, ValueError) as exc:
         cr_records = []
         output["errors"]["crossref"] = str(exc)
     try:
-        oa_records = [
-            compact_openalex(item)
-            for item in openalex(doi, args.title, args.rows)
-        ]
-    except (
-        urllib.error.URLError,
-        urllib.error.HTTPError,
-        TimeoutError,
-        KeyError,
-        ValueError,
-    ) as exc:
+        oa_records = [compact_openalex(item) for item in openalex(doi, args.title, args.rows)]
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, KeyError, ValueError) as exc:
         oa_records = []
         output["errors"]["openalex"] = str(exc)
 
@@ -230,14 +216,7 @@ def main() -> int:
     output["crossref"] = {"best_match": cr_best, "candidates": cr_records}
     output["openalex"] = {"best_match": oa_best, "candidates": oa_records}
     output["verification"] = compare(cr_best, oa_best)
-    print(
-        json.dumps(
-            output,
-            ensure_ascii=False,
-            indent=2 if args.pretty else None,
-            sort_keys=args.pretty,
-        )
-    )
+    print(json.dumps(output, ensure_ascii=False, indent=2 if args.pretty else None, sort_keys=args.pretty))
     return 0 if output["verification"]["status"] != "unverified" else 2
 
 

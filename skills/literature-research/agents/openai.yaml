@@ -1,7 +1,7 @@
 interface:
   display_name: "文献调研"
-  short_description: "跨学术数据库完成检索、核验、去重、证据分级与综述输出"
-  default_prompt: "Use $literature-research to search, verify, deduplicate, and synthesize the literature on this topic with traceable citations."
+  short_description: "检索核验论文、区分版本并安全下载开放全文"
+  default_prompt: "Use $literature-research to search, verify, deduplicate, and retrieve legal open full text for the literature on this topic."
 dependencies:
   tools:
     - type: "mcp"
@@ -12,4 +12,3 @@ dependencies:
       description: "arXiv preprint search and full-text retrieval"
 policy:
   allow_implicit_invocation: true
-

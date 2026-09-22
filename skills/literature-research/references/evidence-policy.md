@@ -30,4 +30,3 @@ Preserve relationships among preprint, accepted manuscript, conference paper, jo
 ## Review quality
 
 Record search date, databases, query strings, filters, and inclusion decisions. For systematic-style work, preserve excluded full-text candidates and reasons. Treat citation counts as database- and time-dependent signals.
-
